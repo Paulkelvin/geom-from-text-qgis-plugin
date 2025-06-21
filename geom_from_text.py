@@ -446,11 +446,33 @@ class GeomFromTextOptimized:
                 roads.dataProvider().addFeatures(all_roads)
                 beacons.dataProvider().addFeatures(all_beacons)
                 
-                # OPTIMIZED: Use correct feature IDs for zooming
+                # OPTIMIZED: Robust zoom to features using unique attributes
                 if new_ids:
                     try:
-                        canvas.zoomToFeatureIds(parcels, new_ids)
-                        self.iface.messageBar().pushMessage('Info', f'Zoomed to feature IDs: {new_ids}', level=Qgis.Info, duration=2)
+                        # Get the parcel numbers for the newly added features
+                        parcel_nums = []
+                        for feat in parcels.selectedFeatures():
+                            parcel_num = feat['parcel_num']
+                            parcel_nums.append(parcel_num)
+                        
+                        parcels.removeSelection()  # Clear selection first
+                        
+                        # Query features by parcel_num (unique attribute) for reliable zoom
+                        all_found_ids = []
+                        for parcel_num in parcel_nums:
+                            expr = f'"parcel_num" = {parcel_num}'
+                            request = QgsFeatureRequest().setFilterExpression(expr)
+                            found_ids = [f.id() for f in parcels.getFeatures(request)]
+                            all_found_ids.extend(found_ids)
+                        
+                        if all_found_ids:
+                            # Select and zoom to the found features
+                            parcels.selectByIds(all_found_ids)
+                            canvas.zoomToFeatureIds(parcels, all_found_ids)
+                            self.iface.messageBar().pushMessage('Info', f'Zoomed to {len(all_found_ids)} features with parcel_nums: {parcel_nums}', level=Qgis.Info, duration=3)
+                        else:
+                            self.iface.messageBar().pushMessage('Warning', f'No features found for parcel_nums: {parcel_nums}', level=Qgis.Warning, duration=3)
+                            
                     except Exception as e:
                         self.iface.messageBar().pushMessage('Warning', f'Zoom failed: {str(e)}', level=Qgis.Warning, duration=3)
                 else:
