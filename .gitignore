@@ -1,0 +1,34 @@
+# Sensitive configuration files
+config.ini
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Log files
+*.log
+send_request.log
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary files
+*.tmp
+*.temp
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# QGIS specific
+*.qgs~
+*.qgz~
+
+# Development files
+*.zip 
