@@ -65,3 +65,89 @@ class GeomFromTextReview(QtWidgets.QDialog, FORM_CLASS1):
         """Constructor."""
         super(GeomFromTextReview, self).__init__(parent)
         self.setupUi(self)
+        
+        # Connect the zoom button to zoom functionality
+        self.btnZoom.clicked.connect(self.zoom_to_parcels)
+        self.review_layer = None  # Will be set by the main plugin
+        
+    def set_review_layer(self, layer):
+        """Set the review layer to zoom to."""
+        self.review_layer = layer
+        
+    def zoom_to_parcels(self):
+        """Zoom to the parcels in the review layer using robust querying."""
+        try:
+            from qgis.core import QgsProject, QgsFeatureRequest
+            from qgis import Qgis
+            
+            # Get the main parcels layer from the project
+            parcels_layer = None
+            for layer in QgsProject.instance().mapLayers().values():
+                if layer.name() == 'parcels' and layer.geometryType() == 2:  # Polygon layer
+                    parcels_layer = layer
+                    break
+            
+            if not parcels_layer:
+                # Fallback: try to find any polygon layer that might be parcels
+                for layer in QgsProject.instance().mapLayers().values():
+                    if layer.geometryType() == 2 and 'parcel' in layer.name().lower():
+                        parcels_layer = layer
+                        break
+            
+            if not parcels_layer:
+                print("No parcels layer found for zooming")
+                return
+            
+            # Get the canvas
+            canvas = self.parent().iface.mapCanvas() if hasattr(self.parent(), 'iface') else None
+            if not canvas:
+                print("Canvas not available for zooming")
+                return
+            
+            # Query for all features in the review layer to get their parcel numbers
+            if self.review_layer and self.review_layer.isValid():
+                parcel_nums = []
+                for feature in self.review_layer.getFeatures():
+                    parcel_num = feature['parcel_num']
+                    if parcel_num:
+                        parcel_nums.append(parcel_num)
+                
+                if parcel_nums:
+                    # Query the main parcels layer for these parcel numbers
+                    all_found_ids = []
+                    for parcel_num in parcel_nums:
+                        expr = f'"parcel_num" = {parcel_num}'
+                        request = QgsFeatureRequest().setFilterExpression(expr)
+                        found_ids = [f.id() for f in parcels_layer.getFeatures(request)]
+                        all_found_ids.extend(found_ids)
+                    
+                    if all_found_ids:
+                        # Select and zoom to the found features
+                        parcels_layer.selectByIds(all_found_ids)
+                        canvas.zoomToFeatureIds(parcels_layer, all_found_ids)
+                        self.parent().iface.messageBar().pushMessage('Info', f'Zoomed to {len(all_found_ids)} parcels with parcel_nums: {parcel_nums}', level=Qgis.Info, duration=3)
+                    else:
+                        # Fallback: zoom to review layer extent
+                        canvas.setExtent(self.review_layer.extent().scaled(1.2))
+                        canvas.refresh()
+                        self.parent().iface.messageBar().pushMessage('Info', 'Zoomed to review layer extent (fallback)', level=Qgis.Info, duration=2)
+                else:
+                    # No parcel numbers found, zoom to review layer extent
+                    canvas.setExtent(self.review_layer.extent().scaled(1.2))
+                    canvas.refresh()
+                    self.parent().iface.messageBar().pushMessage('Info', 'Zoomed to review layer extent', level=Qgis.Info, duration=2)
+            else:
+                print("Review layer not available for zooming")
+                
+        except Exception as e:
+            print(f"Error zooming to parcels: {str(e)}")
+            # Fallback: try to zoom to review layer if available
+            if self.review_layer and self.review_layer.isValid():
+                try:
+                    canvas = self.parent().iface.mapCanvas() if hasattr(self.parent(), 'iface') else None
+                    if canvas:
+                        canvas.setExtent(self.review_layer.extent().scaled(1.2))
+                        canvas.refresh()
+                        self.parent().iface.messageBar().pushMessage('Info', 'Zoomed to review layer (error fallback)', level=Qgis.Info, duration=2)
+                except:
+                    pass
