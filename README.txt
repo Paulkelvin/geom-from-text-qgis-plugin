@@ -1,3 +1,51 @@
+# Geom From Text Optimized - QGIS Plugin
+
+This plugin creates new cadastre parcels and beacons from CSV files with optimized performance and spatial join capabilities.
+
+## Setup Instructions
+
+### 1. Database Configuration
+The plugin requires a PostgreSQL/PostGIS database connection. To configure:
+
+1. Copy `config.template.ini` to `config.ini`
+2. Edit `config.ini` with your database settings:
+   ```ini
+   [PG]
+   Host=your_database_host
+   Port=5432
+   Database=your_database_name
+   UserName=your_username
+   Password=your_password
+   
+   [SERVICE]
+   EndPoint=http://your_api_host:port/qgis-plugin-endpoint
+   ```
+
+### 2. Installation
+1. Extract the plugin to your QGIS plugins directory
+2. Restart QGIS
+3. Enable the plugin in Plugins → Manage and Install Plugins
+
+## Features
+
+- ✅ Ultra-fast database connections
+- ✅ Spatial joins with LGA and blocks
+- ✅ Automatic parcel numbering
+- ✅ Progress logging and error handling
+- ✅ Optimized batch processing
+- ✅ Development workflow tools
+
+## Development
+
+Use the provided PowerShell scripts for development:
+- `quick_sync.ps1` - Quick sync to QGIS plugins directory
+- `sync_plugin.ps1` - Full plugin sync
+- `setup_dev_mode.ps1` - Setup development environment
+
+## Security Note
+
+The `config.ini` file contains sensitive database credentials and is excluded from version control. Always use your own database settings and never commit real credentials to version control.
+
 Plugin Builder Results
 
 Your plugin GeomFromText was created in:
