@@ -3,9 +3,10 @@
 # This file should be included when you package your plugin.# Mandatory items:
 
 [general]
-name=Geom from Text
+name=GeomFromTextOptimized
 qgisMinimumVersion=3.0
-description=This plugin creates new cadastre parcels and beacons
+title=Geom From Text (Optimized)
+description=Optimized version of GeomFromText plugin for QGIS. Includes performance improvements and UI responsiveness.
 version=0.5
 author=Sivan Design D.S. Ltd.
 email=guy.magen@sivandesign.com

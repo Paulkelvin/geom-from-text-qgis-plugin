@@ -21,7 +21,7 @@
  *                                                                         *
  ***************************************************************************/
 """
-from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, Qt, QDate
+from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, Qt, QThread
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction, QMessageBox
 from qgis.core import (QgsVectorLayer,
@@ -40,9 +40,11 @@ from qgis.core import (QgsVectorLayer,
                        QgsMessageLog)
 from qgis import processing
 import configparser
-from datetime import date
+from PyQt5.QtCore import QDate
 import sys
 import subprocess
+from qgis.PyQt.QtCore import QThread
+from .processing_worker import GeomFromTextWorker
 
 # Initialize Qt resources from file resources.py
 from .resources import *
@@ -50,7 +52,7 @@ from .resources import *
 from .geom_from_text_dialog import GeomFromTextDialog, GeomFromTextReview
 import os.path
 
-class GeomFromText:
+class GeomFromTextOptimized:
     """QGIS Plugin Implementation."""
 
     def __init__(self, iface):
@@ -178,7 +180,7 @@ class GeomFromText:
     def initGui(self):
         """Create the menu entries and toolbar icons inside the QGIS GUI."""
 
-        icon_path = ':/plugins/geom_from_text/icon.png'
+        icon_path = ':/plugins/geom_from_text/icon_new.png'
         self.add_action(
             icon_path,
             text=self.tr(u'Add parcels from CSV'),
@@ -197,630 +199,281 @@ class GeomFromText:
                 action)
             self.iface.removeToolBarIcon(action)
 
+    def on_progress_message(self, message):
+        """Handle progress messages from the worker"""
+        self.iface.messageBar().pushMessage('Processing', message, level=Qgis.Info, duration=3)
+        # Also print to console for debugging
+        print(f"PROGRESS: {message}")
 
     def run(self):
         """Run method that performs all the real work"""
 
-        # Create the dialog with elements (after translation) and keep reference
-        # Only create GUI ONCE in callback, so that it will only load when the plugin is started
         if self.first_start == True:
             self.first_start = False
             self.dlg = GeomFromTextDialog()
             self.dlgRev = GeomFromTextReview()
 
-        
-        # keep dialog window on top
         self.dlg.setWindowFlags(Qt.WindowStaysOnTopHint)
-        # show the dialog
         self.dlg.show()
-        # Run the dialog event loop
         result = self.dlg.exec_()
-        # See if OK was pressed
         if result:
-
-            # ----------------------------------------- geom_from_text code -----------------------------------------
-            ### Dialog window inputs ###
-
-            # get file path from the QgsFileWigdet in the user dialog
+            # --- Get user input ---
             csv_path = self.dlg.qfw.filePath()
-
-            # get crs from comboBox in the user dialog
             epsg = self.dlg.cmb.itemData(self.dlg.cmb.currentIndex())
-
-            # get application number from the lineEdit in the user dialog
             app_num = self.dlg.ldt.text().strip()
-            
-            # -------------------------------------------------------------------------------------------------------
-            ### Functions ###
-            
-            # create road feature from point features list and offset value
-            def createRoadFeature(points_list, roads_lyr, offset, tr=None):
-                # create line geom
-                line_geom = QgsGeometry.fromPolylineXY(points_list)
-                # transform
-                if tr: line_geom.transform(tr)
-                # offset geom
-                line_geom = line_geom.offsetCurve(offset, 8, QgsGeometry.JoinStyleMiter, 2)
-                # create line feature
-                fields = roads_lyr.fields()
-                line_feat = QgsFeature(fields)
-                # set offset attribute
-                line_feat.setAttribute(fields.indexFromName('offset'), offset)
-                line_feat.setGeometry(line_geom)
-                
-                return line_feat
-            
-            # create UPI components using a polygon feature - LGA, Block Number and Parcel Number
-            def createUPI(poly_feat, lga_lyr, blocks_lyr, parcel_lkp):
-                # create centroid point layer
-                centroid = poly_feat.geometry().centroid()
-                point_feat = QgsFeature()
-                point_feat.setGeometry(centroid)
-                point_lyr = QgsVectorLayer('Point?crs=epsg:26331', 'point', 'memory')
-                point_lyr.dataProvider().addFeatures([point_feat])
-                
-                # get LGA number
-                out = processing.run("native:joinattributesbylocation", {'INPUT':point_lyr,
-                                                                         'PREDICATE':[0],
-                                                                         'JOIN':lga_lyr,
-                                                                         'JOIN_FIELDS':['lga_num'],
-                                                                         'METHOD':0,
-                                                                         'DISCARD_NONMATCHING':False,
-                                                                         'PREFIX':'',
-                                                                         'OUTPUT':'memory:'})['OUTPUT']
-                lga_num = [feat['lga_num'] for feat in out.getFeatures()][0]
-                
-                # get block number
-                out = processing.run("native:joinattributesbylocation", {'INPUT':point_lyr,
-                                                                         'PREDICATE':[0],
-                                                                         'JOIN':blocks_lyr,
-                                                                         'JOIN_FIELDS':['block_num'],
-                                                                         'METHOD':0,
-                                                                         'DISCARD_NONMATCHING':False,
-                                                                         'PREFIX':'',
-                                                                         'OUTPUT':'memory:'})['OUTPUT']
-                block_num = [feat['block_num'] for feat in out.getFeatures()][0]
-                if not(block_num): block_num = 999 # undefined
 
-                # get parcel number
-                if block_num != 999:
-                    # select by block number
-                    expression = "(\"block_num\" = '{}')".format(block_num) + ' AND ' + "(\"lga_num\" = '{}')".format(lga_num)
+            # --- Disable OK button and set wait cursor ---
+            ok_button = self.dlg.button_box.button(self.dlg.button_box.Ok)
+            if ok_button:
+                ok_button.setEnabled(False)
+            self.iface.mainWindow().setCursor(Qt.WaitCursor)
+
+            # --- Start worker in a QThread ---
+            self.thread = QThread()
+            self.worker = GeomFromTextWorker(csv_path, epsg, app_num, self.plugin_dir)
+            self.worker.moveToThread(self.thread)
+            self.thread.started.connect(self.worker.run)
+            self.worker.finished.connect(self.on_worker_finished)
+            self.worker.finished.connect(self.thread.quit)
+            self.worker.finished.connect(self.worker.deleteLater)
+            self.thread.finished.connect(self.thread.deleteLater)
+            
+            # Connect progress signal to show messages
+            self.worker.progress.connect(self.on_progress_message)
+            
+            self.thread.start()
+            
+            # Test progress message
+            self.iface.messageBar().pushMessage('Info', 'Starting CSV processing...', level=Qgis.Info, duration=3)
+
+    def on_worker_finished(self, result):
+        # --- Restore UI state ---
+        if hasattr(self, 'dlg') and self.dlg:
+            ok_button = self.dlg.button_box.button(self.dlg.button_box.Ok)
+            if ok_button:
+                ok_button.setEnabled(True)
+        self.iface.mainWindow().setCursor(Qt.ArrowCursor)
+
+        # --- Handle result ---
+        if result.get('success'):
+            # Review dialog and feature approval workflow
+            parcels_feats = result['parcels_feats']
+            beacons_feats = result['beacons_feats']
+            roads_feats = result['roads_feats']
+            beacons_dict = result['beacons_dict']
+            roads_dict = result['roads_dict']
+            lga = result['lga']
+            blocks = result['blocks']
+            parcels = result['parcels']
+            beacons = result['beacons']
+            roads = result['roads']
+            parcel_lkp = result['parcel_lkp']
+            lga_num = result['lga_num']
+            block_num = result['block_num']
+            parcel_num = result['parcel_num']
+            data_source = result['data_source']
+            status = result['status']
+            app_num = result['app_num']
+            plugin_dir = result['plugin_dir']
+            parcel_id_list = result['parcel_id_list']
+            
+            # OPTIMIZED: Batch review - create single memory layer for all parcels
+            self.iface.messageBar().pushMessage('Info', 'Creating review layer...', level=Qgis.Info, duration=2)
+            
+            # OPTIMIZED: Disable canvas refreshes during layer creation
+            canvas = self.iface.mapCanvas()
+            canvas.setRenderFlag(False)
+            
+            # Get the fields from the original parcels layer
+            fields = parcels.fields()
+            crs = parcels.crs().authid() if hasattr(parcels, 'crs') else 'EPSG:26331'
+            review_lyr = QgsVectorLayer(f'Polygon?crs={crs}', 'New Parcels for Review', 'memory')
+            review_lyr.dataProvider().addAttributes(list(fields))
+            review_lyr.updateFields()
+            
+            # BATCH ADD: Add all parcels at once to the review layer
+            review_lyr.dataProvider().addFeatures(parcels_feats)
+            
+            # Set styling for review layer
+            review_lyr.setFlags(QgsMapLayer.LayerFlag(8))
+            symbol = QgsFillSymbol.createSimple({
+                'outline_style': 'solid', 
+                'outline_width': '0.66', 
+                'outline_color': 'yellow', 
+                'color': '0,0,0,0'
+            })
+            review_lyr.renderer().setSymbol(symbol)
+            
+            # Add to map and zoom
+            root = QgsProject.instance().layerTreeRoot()
+            root.insertLayer(0, review_lyr)
+            
+            # OPTIMIZED: Re-enable canvas and refresh once
+            canvas.setRenderFlag(True)
+            canvas.setExtent(review_lyr.extent().scaled(1.4))
+            canvas.refresh()
+            
+            # Show review dialog
+            self.dlgRev.setWindowFlags(Qt.WindowStaysOnTopHint)
+            self.dlgRev.show()
+            result_dialog = self.dlgRev.exec_()
+            
+            # Remove review layer
+            root.removeLayer(review_lyr)
+            canvas.refresh()
+            
+            if result_dialog:
+                # User approved - proceed with adding to main layers
+                self.iface.messageBar().pushMessage('Info', 'Adding parcels to database...', level=Qgis.Info, duration=2)
+                
+                # Add parcels to database first
+                new_parcels = parcels.dataProvider().addFeatures(parcels_feats)[1]
+                new_ids = [feat.id() for feat in new_parcels]
+                
+                # OPTIMIZED: Log the feature IDs for debugging
+                self.iface.messageBar().pushMessage('Info', f'Added {len(new_parcels)} parcels with IDs: {new_ids}', level=Qgis.Info, duration=3)
+                
+                # OPTIMIZED: Batch parcel numbering operations
+                self.iface.messageBar().pushMessage('Info', 'Assigning parcel numbers...', level=Qgis.Info, duration=2)
+                
+                parcels.select(new_ids)
+                parcels.startEditing()
+                parcels_fields = parcels.fields()
+                
+                # Collect all LGA/block combinations to process in batch
+                lga_block_combinations = set()
+                for feat in parcels.selectedFeatures():
+                    lga_block_combinations.add((feat['lga_num'], feat['block_num']))
+                
+                # Batch query and update parcel lookup table
+                parcel_lkp.startEditing()
+                
+                # Process each unique LGA/block combination
+                for lga_num, block_num in lga_block_combinations:
+                    expression = f'("block_num" = {block_num}) AND ("lga_num" = {lga_num})'
                     parcel_lkp.selectByExpression(expression)
+                    
                     if parcel_lkp.selectedFeatures():
+                        # Update existing counter
                         counter = parcel_lkp.selectedFeatures()[0]
                         parcel_count = counter['parcel_count'] + 1
                         parcel_lkp.removeSelection()
-                        # update counter
-                        parcel_lkp.startEditing()
                         counter['parcel_count'] = parcel_count
                         parcel_lkp.updateFeature(counter)
                     else:
-                        # create new block parcel counter
+                        # Create new counter
+                        parcel_count = 1
                         fields = parcel_lkp.fields()
                         counter = QgsFeature(fields)
-                        # set attributes
                         counter.setAttribute(fields.indexFromName('lga_num'), lga_num)
                         counter.setAttribute(fields.indexFromName('block_num'), block_num)
-                        counter.setAttribute(fields.indexFromName('parcel_count'), 1)
-                        # add feature
-                        parcel_lkp.startEditing()
+                        counter.setAttribute(fields.indexFromName('parcel_count'), parcel_count)
                         parcel_lkp.addFeature(counter)
-                        parcel_count = 1
-                    parcel_num = parcel_count
-                else:
-                    parcel_num = None
                 
-                return (lga_num, block_num, parcel_num)
-                    
-            # -------------------------------------------------------------------------------------------------------
-            ### DBSERVER layers connection ###
-
-            # INI file path
-            ini_path = os.path.join(self.plugin_dir, 'config.ini')
-            # read INI file
-            config = configparser.ConfigParser()
-            config.read(ini_path)
-            # get connection settings
-            host = config['PG']['Host'].strip()
-            port = config['PG']['Port'].strip()
-            database = config['PG']['Database'].strip()
-            username = config['PG']['UserName'].strip()
-            password = config['PG']['Password'].strip()
-            data_source = config['DEFAULT_FIELDS']['DataSource'].strip() # default data source value
-            status = config['DEFAULT_FIELDS']['Status'].strip() # default status value
-
-            # set connection
-            uri = QgsDataSourceUri()
-            uri.setConnection(host, port, database, username, password)
-
-            # set Beacons layer
-            uri.setDataSource('public', 'land_registration___beacons', 'geometry', '')
-            beacons = QgsVectorLayer(uri.uri(), 'beacons', 'postgres')
-            # set Parcels layer
-            uri.setDataSource('public', 'land_registration___parcels', 'geometry', '')
-            parcels = QgsVectorLayer(uri.uri(), 'parcels', 'postgres')
-            # set Blocks layer
-            uri.setDataSource('public', 'land_registration___blocks', 'geometry', '')
-            blocks = QgsVectorLayer(uri.uri(), 'blocks', 'postgres')
-            # set LGA layer
-            uri.setDataSource('public', 'ogun_admin___lgas', 'geometry', '')
-            lga = QgsVectorLayer(uri.uri(), 'lga', 'postgres')
-            # set Parcel Roads layer
-            uri.setDataSource('public', 'land_registration___parcel_roads', 'geom', '')
-            roads = QgsVectorLayer(uri.uri(), 'roads', 'postgres')
-            # set Parcel Lookup table
-            uri.setDataSource('public', 'land_registration___parcel_lookup', '', '')
-            parcel_lkp = QgsVectorLayer(uri.uri(), 'parcel_lkp', 'postgres')
-
-            # -------------------------------------------------------------------------------------------------------
-            ### set transformation ###
-
-            if epsg in [26391, 32631]:
-                from_crs = QgsCoordinateReferenceSystem.fromEpsgId(epsg) # NNO or WGS84 / UTM zone 31N
-                to_crs = QgsCoordinateReferenceSystem.fromEpsgId(26331) # Minna / UTM zone 31N
-                tr = QgsCoordinateTransform(from_crs, to_crs, QgsProject.instance())
-            else:
-                tr = None
-
-            # -------------------------------------------------------------------------------------------------------
-            ### read csv and create new features ###
-            
-            # new features lists
-            parcel_points = [] # QgsPoint list
-            road_points = [] # QgsPoint list
-            beacons_feats = [] # QgsFeature list
-            parcels_feats = [] # QgsFeature list
-            roads_feats = [] # QgsFeature list
-
-            # dictionaries
-            '''
-            dictionaries that maintains a list of features for each parcel_id
-            '''
-            beacons_dict = {}
-            roads_dict = {}
-
-            # fields
-            parcels_fields = parcels.fields()
-            beacons_fields = beacons.fields()
-
-            # error indicator
-            is_error = False
-
-            # offset indicator
-            is_offset = False
-
-            # read csv
-            with open(csv_path, 'r') as crds:
+                # Single commit for all parcel lookup changes
+                parcel_lkp.commitChanges()
                 
-                # list of rows
-                rows = crds.readlines()
-
-                # first row after headers
-                first_row = rows[1].strip().split(',') # list of strings
+                # OPTIMIZED: Preserve parcel numbers from worker, don't overwrite them
+                # The parcel numbers were already set correctly in processing_worker.py
+                # We don't need to query the lookup table for parcel numbers
                 
-                # new parcel indicator
-                current_parcel_id = first_row[0]
-
-                # initial bearing and distance
-                try:
-                    bearing = float(first_row[4]) + float(first_row[5]) / 60
-                    dist = float(first_row[6])
-                except:
-                    pass
-                    
-                # 1st point
-                try:
-                    first_point = QgsPointXY(float(first_row[2]), float(first_row[3]))
-                except:
-                    is_error = True
-                    QMessageBox.critical(self.iface.mainWindow(),
-                                        'Error',
-                                        'No XY values for starting point.\nPlease check 1st Parcel')
-                    self.iface.messageBar().pushMessage('Error', 'Failed to add parcels', level=Qgis.Critical, duration=3)
-
-                # iterate points
-                if not is_error:
-                    for row in rows[1:]:
-                        
-                        # convert one string to a list of strings
-                        row = row.strip().split(',')
-                        
-                        # attributes
-                        parcel_id = row[0]
-                        beacon_num = row[1]
-
-                        # process 1st parcel only - web service modification
-                        if parcel_id != current_parcel_id:
-                            break
-
-                        # xy values indicator
-                        is_xy = False
-                        
-                        # get xy values
-                        if row[2] and row[3]:
-                            is_xy = True
-                            try:
-                                x = float(row[2])
-                                y = float(row[3])
-                            except:
-                                is_error = True
-                                QMessageBox.critical(self.iface.mainWindow(),
-                                                    'Error',
-                                                    'Invalid XY value.\nPlease check Parcel: {}, Beacon: {}'.format(parcel_id, beacon_num))
-                                self.iface.messageBar().pushMessage('Error', 'Failed to add parcels', level=Qgis.Critical, duration=3)
-                                break
-                        
-                        # get bearing and distance values
-                        if all(row[4:7]):
-                            try:
-                                new_bearing = float(row[4]) + float(row[5]) / 60
-                                new_dist = float(row[6])
-                            except:
-                                is_error = True
-                                QMessageBox.critical(self.iface.mainWindow(),
-                                                    'Error',
-                                                    'Invalid Bearing/Distance value.\nPlease check Parcel: {}, Beacon: {}'.format(parcel_id, beacon_num))
-                                self.iface.messageBar().pushMessage('Error', 'Failed to add parcels', level=Qgis.Critical, duration=3)
-                                break
-                        else:
-                            new_bearing = None
-                            new_dist = None
-                        
-                        # create point
-                        if is_xy:
-                            point = QgsPointXY(x, y)
-                        else:
-                            # project previous point
-                            point = point.project(dist, bearing)
-                            
-                        # set new bearing and distance
-                        bearing = new_bearing
-                        dist = new_dist
-                        
-                        # code for the same parcel
-                        if parcel_id == current_parcel_id:
-                            # add parcel point
-                            parcel_points.append(point)
-
-                            # add road feature
-                            '''
-                            if previous row has offset value use current and previous point to create new road feature
-                            road segment is made from two points only
-                            '''
-                            if is_offset:
-                                # add 2nd point
-                                road_points.append(point)
-                                # create road feature
-                                road_feat = createRoadFeature(road_points, roads, offset, tr)
-                                roads_feats.append(road_feat)
-                                # reset
-                                road_points = []
-                                is_offset = False
-
-                            # add 1st point
-                            if row[7]:
-                                offset = float(row[7])
-                                road_points.append(point)
-                                is_offset = True
-
-                            # add beacon feature
-                            point_geom = QgsGeometry.fromPointXY(point)
-                            if tr: point_geom.transform(tr)
-                            new_beacon = QgsFeature(beacons_fields) # create feature
-                            new_beacon.setAttribute(beacons_fields.indexFromName('beacon_num'), beacon_num)
-                            new_beacon.setAttribute(beacons_fields.indexFromName('x'), point.x())
-                            new_beacon.setAttribute(beacons_fields.indexFromName('y'), point.y())
-                            new_beacon.setAttribute(beacons_fields.indexFromName('date_created'), QDate(date.today()))
-                            new_beacon.setGeometry(point_geom) # set geometry
-                            beacons_feats.append(new_beacon)
-
-                        # code for a new parcel
-                        else:
-                            if not is_xy:
-                                # error
-                                is_error = True
-                                QMessageBox.critical(self.iface.mainWindow(),
-                                                    'Error',
-                                                    'No XY values for starting point.\nPlease check Parcel: {}'.format(parcel_id))
-                                self.iface.messageBar().pushMessage('Error', 'Failed to add parcels', level=Qgis.Critical, duration=3)
-                                break
-
-                            # reset bearing and distance
-                            bearing = new_bearing
-                            dist = new_dist
-
-                            # add new parcel
-                            poly = QgsGeometry.fromPolygonXY([parcel_points]) # QgsPolygon
-                            # validate geometry
-                            if not poly.validateGeometry():
-                                if tr: poly.transform(tr)
-                                new_parcel = QgsFeature(parcels_fields) # feature
-                                new_parcel.setGeometry(poly) # geometry
-                                area = poly.area()
-                                atts = createUPI(new_parcel, lga, blocks, parcel_lkp)
-                                lga_num = atts[0]
-                                block_num = atts[1]
-                                parcel_num = atts[2]
-                                new_parcel.setAttribute(parcels_fields.indexFromName('lga_num'), lga_num)
-                                new_parcel.setAttribute(parcels_fields.indexFromName('block_num'), block_num)
-                                new_parcel.setAttribute(parcels_fields.indexFromName('parcel_num'), parcel_num)
-                                new_parcel.setAttribute(parcels_fields.indexFromName('area'), area)
-                                new_parcel.setAttribute(parcels_fields.indexFromName('data_source'), data_source)
-                                new_parcel.setAttribute(parcels_fields.indexFromName('status'), status)
-                                new_parcel.setAttribute(parcels_fields.indexFromName('date_created'), QDate(date.today()))
-                                parcels_feats.append(new_parcel)
-                                # add parcel point
-                                parcel_points = [point] # new list
-                            else:
-                                # discard lookup parcel count
-                                parcel_lkp.rollBack()
-                                # error
-                                is_error = True
-                                QMessageBox.critical(self.iface.mainWindow(),
-                                                    'Error',
-                                                    'Invalid Parcel geometry.\nPlease check Parcel: {}'.format(current_parcel_id))
-                                self.iface.messageBar().pushMessage('Error', 'Failed to add parcels', level=Qgis.Critical, duration=3)
-                                break
-                            
-                            # add road feature
-                            '''
-                            if we have offset value in the last row of a parcel group
-                            we need to create a road between last point and first point
-                            '''
-                            # set 1st point
-                            first_point = point
-
-                            if is_offset:
-                                # add first point
-                                road_points.append(first_point)
-                                # create road feature
-                                road_feat = createRoadFeature(road_points, roads, offset, tr)
-                                roads_feats.append(road_feat)
-                                # reset
-                                road_points = []
-                                is_offset = False
-                            
-                            # add 1st point
-                            if row[7]:
-                                offset = float(row[7])
-                                road_points.append(point)
-                                is_offset = True
-
-                            # add roads features to dict
-                            if current_parcel_id in roads_dict:
-                                roads_dict[current_parcel_id].append(roads_feats)
-                            else:
-                                roads_dict[current_parcel_id] = roads_feats
-                            roads_feats = []
-
-                            # add beacon
-                            point_geom = QgsGeometry.fromPointXY(first_point)
-                            if tr: point_geom.transform(tr)
-                            new_beacon = QgsFeature(beacons_fields) # create feature
-                            new_beacon.setAttribute(beacons_fields.indexFromName('beacon_num'), beacon_num)
-                            new_beacon.setAttribute(beacons_fields.indexFromName('x'), first_point.x())
-                            new_beacon.setAttribute(beacons_fields.indexFromName('y'), first_point.y())
-                            new_beacon.setAttribute(beacons_fields.indexFromName('date_created'), QDate(date.today()))
-                            new_beacon.setGeometry(point_geom) # set geometry
-                            
-                            # add beacons features to dict
-                            beacons_dict[current_parcel_id] = beacons_feats
-                            beacons_feats = [new_beacon]
-                            current_parcel_id = parcel_id # new parcel
-                            
-                if not is_error:
-                    # add last parcel
-                    poly = QgsGeometry.fromPolygonXY([parcel_points]) # QgsPolygon
-                    # validate geometry
-                    '''
-                    if the last parcel geometry is valid we can add all features to the layers
-                    and update the parcel lookup table
-                    '''
-                    if not poly.validateGeometry():
-                        if tr: poly.transform(tr)
-                        new_parcel = QgsFeature(parcels_fields) # feature
-                        new_parcel.setGeometry(poly) # geometry
-                        area = poly.area() # area
-                        atts = createUPI(new_parcel, lga, blocks, parcel_lkp)
-                        lga_num = atts[0]
-                        block_num = atts[1]
-                        parcel_num = atts[2]
-                        new_parcel.setAttribute(parcels_fields.indexFromName('lga_num'), lga_num)
-                        new_parcel.setAttribute(parcels_fields.indexFromName('block_num'), block_num)
-                        new_parcel.setAttribute(parcels_fields.indexFromName('parcel_num'), parcel_num)
-                        new_parcel.setAttribute(parcels_fields.indexFromName('area'), area)
-                        new_parcel.setAttribute(parcels_fields.indexFromName('data_source'), data_source)
-                        new_parcel.setAttribute(parcels_fields.indexFromName('status'), status)
-                        new_parcel.setAttribute(parcels_fields.indexFromName('date_created'), QDate(date.today()))
-                        parcels_feats.append(new_parcel)
-                        
-                        # add last road feature
-                        if is_offset:
-                            road_points.append(first_point)
-                            road_feat = createRoadFeature(road_points, roads, offset, tr)
-                            roads_feats.append(road_feat)
-                        # add roads features to dict
-                        if parcel_id in roads_dict:
-                            roads_dict[parcel_id].append(roads_feats)
-                        else:
-                            roads_dict[parcel_id] = roads_feats
-                        
-                        # add beacons features to dict
-                        beacons_dict[parcel_id] = beacons_feats
-
+                # Get the parcel numbers that were already set in the worker
+                parcel_nums = []
+                for feat in parcels.selectedFeatures():
+                    parcel_num = feat['parcel_num']  # Use the value already set in worker
+                    parcel_nums.append(parcel_num)
+                    self.iface.messageBar().pushMessage('Info', f'Preserved parcel_num={parcel_num} for feature {feat.id()}', level=Qgis.Info, duration=2)
+                
+                # Single commit for all parcel changes (no changes needed, just commit)
+                parcels.commitChanges()
+                
+                # Get the updated values
+                lga_nums = QgsVectorLayerUtils.getValues(parcels, 'lga_num', selectedOnly=True)[0]
+                block_nums = QgsVectorLayerUtils.getValues(parcels, 'block_num', selectedOnly=True)[0]
+                parcels.removeSelection()
+                
+                parcel_ids = list(beacons_dict.keys())
+                upi_dict = dict(zip(parcel_ids, zip(lga_nums, block_nums, parcel_nums)))
+                
+                # OPTIMIZED: Add defensive logging for upi_dict
+                self.iface.messageBar().pushMessage('Info', f'UPI dict contains {len(upi_dict)} entries', level=Qgis.Info, duration=2)
+                
+                # Collect all roads and beacons for batch processing
+                all_roads = []
+                all_beacons = []
+                
+                for k in roads_dict:
+                    # OPTIMIZED: Defensive coding for missing keys
+                    if k in upi_dict:
+                        lga_val = upi_dict[k][0]
+                        block_val = upi_dict[k][1]
+                        parcel_val = upi_dict[k][2]
                     else:
-                        # discard lookup parcel count
-                        parcel_lkp.rollBack()
-                        is_error = True
-                        # error
-                        QMessageBox.critical(self.iface.mainWindow(),
-                                            'Error',
-                                            'Invalid Parcel geometry.\nPlease check Parcel: {}'.format(current_parcel_id))
-                        self.iface.messageBar().pushMessage('Error', 'Failed to add new parcels', level=Qgis.Critical, duration=3)
-
-                    # -------------------------------------------------------------------------------------------------------
-                    ### new parcels review process ###
-
-                    if not(is_error):
-                        # map canvas
-                        canvas = self.iface.mapCanvas()
-                        
-                        # zoom function
-                        def zoomToLayer(layer):
-                            canvas.setExtent(layer.extent().scaled(1.4))
-                            canvas.refresh()
-                        
-                        # user approval indicator
-                        all_approved = True
-
-                        # display each parcel feature
-                        for parcel in parcels_feats:
-                            parcel_lyr = QgsVectorLayer('Polygon?crs=epsg:26331', 'New Parcel', 'memory') # temp layer
-                            parcel_lyr.dataProvider().addFeatures([parcel])
-                            parcel_lyr.setFlags(QgsMapLayer.LayerFlag(8)) # set private and required
-                            #parcel_lyr.setFlags(QgsMapLayer.LayerFlag(0)) # set required
-                            #parcel_lyr.setReadOnly(True)
-                            # set symbology
-                            symbol = QgsFillSymbol.createSimple({'outline_style': 'solid', 'outline_width': '0.66', 'outline_color': 'yellow', 'color':'0,0,0,0'})
-                            parcel_lyr.renderer().setSymbol(symbol)
-                            # connect zoom function to zoom button
-                            self.dlgRev.btnZoom.clicked.connect(lambda: zoomToLayer(parcel_lyr))
-                            # add layer on top and zoom
-                            root = QgsProject.instance().layerTreeRoot()
-                            root.insertLayer(0, parcel_lyr)
-                            zoomToLayer(parcel_lyr)
-                            # open parcel review dialog
-                            self.dlgRev.setWindowFlags(Qt.WindowStaysOnTopHint)
-                            self.dlgRev.show()
-                            result = self.dlgRev.exec_()
-                            # remove layer
-                            root.removeLayer(parcel_lyr)
-                            canvas.refresh()
-                            if result:
-                                continue
-                            else:
-                                all_approved = False
-                                QMessageBox.critical(self.iface.mainWindow(),
-                                            'Error',
-                                            'Parcel disapproved by user')
-                                self.iface.messageBar().pushMessage('Error', 'Failed to add new parcels', level=Qgis.Critical, duration=3)
-                                break
-                        
-                        # -------------------------------------------------------------------------------------------------------
-                        ### add new parcels ###
-                        
-                        if all_approved:
-                            '''
-                            the next code line updates the new features and outputs a list of the last added features
-                            '''
-                            new_parcels = parcels.dataProvider().addFeatures(parcels_feats)[1]
-                            
-                            # set missing parcel_num values
-                            '''
-                            1) replacing empty parcel_num values with qgs_fid values for all parcels that are not within a block
-                            2) create upi_dict to map upi values for each parcel_id
-                            *necessary for matching upi values to each road/beacon feature
-                            '''
-                            # new parcels ids
-                            new_ids = [feat.id() for feat in new_parcels]
-                            # select new parcels
-                            parcels.select(new_ids)
-                            # update parcel_num
-                            parcels.startEditing()
-                            for feat in parcels.selectedFeatures():
-                                if not feat['parcel_num']:
-                                    # set parcel_num to qgis_fid
-                                    parcels.changeAttributeValue(feat.id(), parcels_fields.indexFromName('parcel_num'), feat.id())
-                            parcels.commitChanges()
-                            # create upi components lists
-                            lga_nums = QgsVectorLayerUtils.getValues(parcels, 'lga_num', selectedOnly=True)[0]
-                            block_nums = QgsVectorLayerUtils.getValues(parcels, 'block_num', selectedOnly=True)[0]
-                            parcel_nums = QgsVectorLayerUtils.getValues(parcels, 'parcel_num', selectedOnly=True)[0]
-                            parcels.removeSelection()
-                        
-                            # create upi_dict
-                            '''
-                            dictionary that maintains a parcel_num value for each parcel_id
-                            '''
-                            parcel_ids = list(beacons_dict.keys())
-                            upi_dict = dict(zip(parcel_ids, zip(lga_nums, block_nums, parcel_nums)))
-
-                            # add roads
-                            for k in roads_dict:
-                                for feat in roads_dict[k]:
-                                    feat['lga_num'] = upi_dict[k][0]
-                                    feat['block_num'] = upi_dict[k][1]
-                                    feat['parcel_num'] = upi_dict[k][2]
-                                roads.dataProvider().addFeatures(roads_dict[k])
-
-                            # add beacons
-                            for k in beacons_dict:
-                                for feat in beacons_dict[k]:
-                                    feat['lga_num'] = upi_dict[k][0]
-                                    feat['block_num'] = upi_dict[k][1]
-                                    feat['parcel_num'] = upi_dict[k][2]
-                                beacons.dataProvider().addFeatures(beacons_dict[k])
-                            
-                            # commit parcel lookup changes
-                            parcel_lkp.commitChanges()
-                            
-                            # zoom to new parcels
-                            canvas.zoomToFeatureIds(parcels, new_ids)
-
-                            # # message user
-                            # if len(new_parcels) == 1:
-                            #     msg = 'A new parcel has been added to the layer'
-                            # else:
-                            #     msg = '{} new parcels have been added to the layer'.format(len(new_parcels))
-                            # self.iface.messageBar().pushMessage('Done',
-                            #                                     msg,
-                            #                                     level=Qgis.Success, duration=3)
-
-                            # -------------------------------------------------------------------------------------------------------
-                            ### send_request subprocess ###
-
-                            # feature request with filter expression
-                            req = QgsFeatureRequest().setFilterExpression(f'"lga_num" = {lga_num}')
-
-                            # get lga_num from LGA feature request
-                            lga_name = None
-                            for feat in lga.getFeatures(req):
-                                lga_name = feat['lga_name']
-
-                            # path to send_request.py
-                            send_request_path = os.path.join(self.plugin_dir, 'send_request.py')
-
-                            # path to QGIS's python
-                            qgis_base_dir = os.path.dirname(sys.executable) # C:\\PROGRA~1\\QGIS34~1.7\\bin
-                            qgis_python_path = os.path.join(qgis_base_dir, 'python.exe') # C:\\PROGRA~1\\QGIS34~1.7\\bin\\python.exe
-
-                            # construct the command
-                            send_request_cmd = [
-                                qgis_python_path,
-                                send_request_path,
-                                app_num, lga_name, str(block_num), str(parcel_num)
-                            ]
-                            
-                            try:
-                                # run the subprocess
-                                subprocess.run(send_request_cmd, check=True)
-
-                            except subprocess.CalledProcessError:
-                                QMessageBox.warning(self.iface.mainWindow(),
-                                                     'Warning',
-                                                     f'Failed to send Application No. {app_num}\nCheck log file for details')
-                                
-                            except Exception as e:
-                                QMessageBox.warning(self.iface.mainWindow(),
-                                                     'Warning',
-                                                     f'Failed to send Application No. {app_num}\nUnexpected error occurred:\n{str(e)}')
-                                
-                            # message user
-                            if len(new_parcels) == 1:
-                                msg = 'A new parcel has been added to the layer'
-                            else:
-                                msg = '{} new parcels have been added to the layer'.format(len(new_parcels))
-                            self.iface.messageBar().pushMessage('Done',
-                                                                msg,
-                                                                level=Qgis.Success, duration=3)
+                        # Set default values for missing keys
+                        self.iface.messageBar().pushMessage('Warning', f'Missing UPI data for parcel {k}, using defaults', level=Qgis.Warning, duration=3)
+                        lga_val = 999
+                        block_val = 999
+                        parcel_val = 999
+                    
+                    # Process all features for this parcel
+                    for feat in roads_dict[k]:
+                        feat['lga_num'] = lga_val
+                        feat['block_num'] = block_val
+                        feat['parcel_num'] = parcel_val
+                        all_roads.append(feat)
+                
+                for k in beacons_dict:
+                    # OPTIMIZED: Defensive coding for missing keys
+                    if k in upi_dict:
+                        lga_val = upi_dict[k][0]
+                        block_val = upi_dict[k][1]
+                        parcel_val = upi_dict[k][2]
+                    else:
+                        # Set default values for missing keys
+                        self.iface.messageBar().pushMessage('Warning', f'Missing UPI data for parcel {k}, using defaults', level=Qgis.Warning, duration=3)
+                        lga_val = 999
+                        block_val = 999
+                        parcel_val = 999
+                    
+                    # Process all features for this parcel
+                    for feat in beacons_dict[k]:
+                        feat['lga_num'] = lga_val
+                        feat['block_num'] = block_val
+                        feat['parcel_num'] = parcel_val
+                        all_beacons.append(feat)
+                
+                # Batch add all roads and beacons at once
+                roads.dataProvider().addFeatures(all_roads)
+                beacons.dataProvider().addFeatures(all_beacons)
+                
+                # OPTIMIZED: Use correct feature IDs for zooming
+                if new_ids:
+                    try:
+                        canvas.zoomToFeatureIds(parcels, new_ids)
+                        self.iface.messageBar().pushMessage('Info', f'Zoomed to feature IDs: {new_ids}', level=Qgis.Info, duration=2)
+                    except Exception as e:
+                        self.iface.messageBar().pushMessage('Warning', f'Zoom failed: {str(e)}', level=Qgis.Warning, duration=3)
+                else:
+                    self.iface.messageBar().pushMessage('Warning', 'No new parcel IDs to zoom to', level=Qgis.Warning, duration=3)
+                
+                req = QgsFeatureRequest().setFilterExpression(f'"lga_num" = {lga_num}')
+                lga_name = None
+                for feat in lga.getFeatures(req):
+                    lga_name = feat['lga_name']
+                send_request_path = os.path.join(plugin_dir, 'send_request.py')
+                qgis_base_dir = os.path.dirname(sys.executable)
+                qgis_python_path = os.path.join(qgis_base_dir, 'python.exe')
+                send_request_cmd = [qgis_python_path, send_request_path, app_num, lga_name, str(block_num), str(parcel_num)]
+                try:
+                    import subprocess
+                    subprocess.run(send_request_cmd, check=True)
+                except Exception as e:
+                    QMessageBox.warning(self.iface.mainWindow(), 'Warning', f'Failed to send Application No. {app_num}\nUnexpected error occurred:\n{str(e)}')
+                msg = 'A new parcel has been added to the layer' if len(new_parcels) == 1 else f'{len(new_parcels)} new parcels have been added to the layer'
+                self.iface.messageBar().pushMessage('Done', msg, level=Qgis.Success, duration=3)
+            else:
+                # User disapproved
+                QMessageBox.critical(self.iface.mainWindow(), 'Error', 'Parcels disapproved by user')
+                self.iface.messageBar().pushMessage('Error', 'Failed to add new parcels', level=Qgis.Critical, duration=3)
+        else:
+            QMessageBox.critical(self.iface.mainWindow(), 'Error', result.get('error', 'Unknown error'))

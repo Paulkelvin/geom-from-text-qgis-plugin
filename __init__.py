@@ -32,5 +32,5 @@ def classFactory(iface):  # pylint: disable=invalid-name
     :type iface: QgsInterface
     """
     #
-    from .geom_from_text import GeomFromText
-    return GeomFromText(iface)
+    from .geom_from_text import GeomFromTextOptimized
+    return GeomFromTextOptimized(iface)

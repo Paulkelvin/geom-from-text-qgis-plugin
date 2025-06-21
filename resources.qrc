@@ -1,5 +1,6 @@
 <RCC>
     <qresource prefix="/plugins/geom_from_text" >
         <file>icon.png</file>
+        <file>icon_new.png</file>
     </qresource>
 </RCC>
